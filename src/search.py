@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple, Hashable
 
 import chess
 import torch
@@ -8,40 +8,62 @@ import torch
 from .dataprep import encode_board
 from .model import ValueNet
 
+
 def load_model(
-    model_path: str = "/src/value_net.pth",
+    model_path: str = "src/value_net_mini.pth",
     in_channels: int = 18,
-    channels: int = 32,
-    num_blocks: int = 4,
-) -> tuple[ValueNet, torch.device]:
-    """
-    Load the trained value network and return (model, device).
-    Adjust channels/num_blocks to match how you trained. 
-    """
+    channels: int = 16,
+    num_blocks: int = 2,
+) -> Tuple[ValueNet, torch.device]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ValueNet(in_channels=in_channels, channels=channels, num_blocks=num_blocks).to(device)
+    model = ValueNet(
+        in_channels=in_channels,
+        channels=channels,
+        num_blocks=num_blocks,
+    ).to(device)
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
     return model, device
 
 
+# ---------------- NN Evaluation + Cache ---------------- #
+
+EVAL_CACHE: Dict[Hashable, float] = {}
+
+
+def tt_key(board: chess.Board) -> Hashable:
+    # python-chess internal Zobrist key is private but stable within a version
+    if hasattr(board, "_transposition_key"):
+        return board._transposition_key()  # type: ignore[attr-defined]
+    return board.fen()
+
+
 def evaluate(board: chess.Board, model: ValueNet, device: torch.device) -> float:
-    """
-    Evaluate a board position from the POV of the side to move.
-    Returns a scalar in roughly [-1, 1].
-    """
+    # Quick terminal checks
     if board.is_checkmate():
+        # Side to move is checkmated
         return -1.0
-    if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
+    if (
+        board.is_stalemate()
+        or board.is_insufficient_material()
+        or board.can_claim_draw()
+    ):
         return 0.0
 
+    key = tt_key(board)
+    cached = EVAL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     x_np = encode_board(board)
-    x = torch.from_numpy(x_np).unsqueeze(0).to(device)  
+    x = torch.from_numpy(x_np).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        out = model(x)  
-    return float(out.item())
+        out = model(x)
+    v = float(out.item())
+    EVAL_CACHE[key] = v
+    return v
 
 
 # ---------------- Transposition Table ---------------- #
@@ -53,11 +75,14 @@ EXACT, LOWERBOUND, UPPERBOUND = 0, -1, 1
 class TTEntry:
     depth: int
     score: float
-    flag: int      
+    flag: int        # EXACT / LOWERBOUND / UPPERBOUND
     best_move: Optional[chess.Move]
 
 
-TT: Dict[int, TTEntry] = {}
+TT: Dict[Hashable, TTEntry] = {}
+
+# History heuristic (simple per-move key)
+HISTORY: Dict[str, int] = {}
 
 
 # ---------------- Move Ordering ---------------- #
@@ -97,19 +122,27 @@ def mvv_lva_score(board: chess.Board, move: chess.Move) -> int:
 
 def ordered_moves(board: chess.Board, tt_move: Optional[chess.Move] = None):
     """
-    Return legal moves ordered:
-      1) TT move (if any)
-      2) Captures, ordered by MVV-LVA
-      3) Quiet moves
+    Order moves using:
+      - TT move first
+      - captures by MVV-LVA
+      - history heuristic for quiet moves
     """
     moves = list(board.legal_moves)
 
     def key(move: chess.Move):
+        score = 0
+
         if tt_move is not None and move == tt_move:
-            return (3, 0)
+            score += 1_000_000
+
         if board.is_capture(move):
-            return (2, mvv_lva_score(board, move))
-        return (1, 0)
+            score += 100_000 + mvv_lva_score(board, move)
+        else:
+            # Quiet move: use history heuristic
+            mkey = move.uci()
+            score += HISTORY.get(mkey, 0)
+
+        return score
 
     moves.sort(key=key, reverse=True)
     return moves
@@ -126,12 +159,14 @@ def negamax(
     device: torch.device,
 ) -> float:
     """
-    Negamax search with alpha-beta pruning and transposition table.
+    Negamax search with alpha-beta pruning, transposition table,
+    null-move pruning, simple futility pruning, and late-move reductions.
     Returns value from POV of side to move.
     """
     alpha_orig = alpha
-    key = hash(board._transposition_key())
+    key = tt_key(board)
 
+    # Transposition table lookup
     entry = TT.get(key)
     if entry is not None and entry.depth >= depth:
         if entry.flag == EXACT:
@@ -143,27 +178,81 @@ def negamax(
         if alpha >= beta:
             return entry.score
 
-    # Leaf / terminal
-    if depth == 0 or board.is_game_over():
+    # Terminal nodes: game over -> direct eval
+    if board.is_game_over():
         return evaluate(board, model, device)
 
+    # Leaf: direct NN eval (no quiescence)
+    if depth == 0:
+        return evaluate(board, model, device)
+
+    in_check = board.is_check()
+
+    # --- Null-move pruning ---
+    # Skip null-move if in check or in shallow positions
+    if depth >= 3 and not in_check:
+        board.push(chess.Move.null())
+        # Reduce depth more aggressively here for speed
+        score = -negamax(board, depth - 3, -beta, -beta + 1, model, device)
+        board.pop()
+        if score >= beta:
+            return score
+    # --------------------------
+
+    # --- Futility pruning at shallow depth (no checks) ---
+    if depth == 1 and not in_check:
+        # If there are no captures, we can approximate with static eval.
+        if not any(board.is_capture(m) for m in board.legal_moves):
+            static_eval = evaluate(board, model, device)
+            FUT_MARGIN = 0.20  # slightly larger margin for more pruning
+            if static_eval + FUT_MARGIN <= alpha:
+                return static_eval
+    # -----------------------------------------------------
+
     max_score = -math.inf
-    best_move = None
+    best_move: Optional[chess.Move] = None
 
     tt_move = entry.best_move if entry is not None else None
+    moves = ordered_moves(board, tt_move)
 
-    for move in ordered_moves(board, tt_move):
+    for idx, move in enumerate(moves):
+        is_capture = board.is_capture(move)
+
+        # Late-move reductions for non-captures, later moves, and non-check
+        reduction = 0
+        if (
+            depth >= 3
+            and idx >= 4
+            and not is_capture
+            and not in_check
+        ):
+            reduction = 1
+
+        search_depth = depth - 1 - reduction
+
         board.push(move)
-        score = -negamax(board, depth - 1, -beta, -alpha, model, device)
+        score = -negamax(board, search_depth, -beta, -alpha, model, device)
         board.pop()
+
+        # If we reduced and it looks promising, re-search at full depth
+        if reduction > 0 and score > alpha:
+            board.push(move)
+            score = -negamax(board, depth - 1, -beta, -alpha, model, device)
+            board.pop()
 
         if score > max_score:
             max_score = score
             best_move = move
+
         if score > alpha:
             alpha = score
+
         if alpha >= beta:
-            break  
+            # Update history for quiet moves that cause cutoffs
+            if not is_capture:
+                mkey = move.uci()
+                HISTORY[mkey] = HISTORY.get(mkey, 0) + depth * depth
+            break
 
     # Store in TT
     flag = EXACT
@@ -176,7 +265,7 @@ def negamax(
     return max_score
 
 
-# ---------------- Iterative Deepening ---------------- #
+# ---------------- Root Search (no Iterative Deepening) ---------------- #
 
 def evaluate_moves(
     board: chess.Board,
@@ -187,52 +276,38 @@ def evaluate_moves(
 ):
     """
     Returns a dict {move: score} for all legal moves at the root.
+    Single search at max_depth (no iterative deepening) for speed.
     """
-    global TT
-    TT = {}  
+    global TT, EVAL_CACHE, HISTORY
+    TT = {}
+    EVAL_CACHE = {}
+    HISTORY = {}
 
     legal_moves = list(board.legal_moves)
-    scores = {m: 0.0 for m in legal_moves}  
+    scores: Dict[chess.Move, float] = {}
 
-    for depth in range(1, max_depth + 1):
-        print("[Depth {}] Iterative deepening...".format(depth))
-        root_key = hash(board._transposition_key)
-        root_tt = TT.get(root_key)
-        tt_move = root_tt.best_move if root_tt is not None else None
-        ordered = ordered_moves(board, tt_move)
+    if verbose:
+        print(f"[Root] Searching depth {max_depth} over {len(legal_moves)} moves...")
 
-        if verbose:
-            print(f"[Depth {depth}] Evaluating {len(ordered)} moves...")
+    # Root move ordering (TT is empty at first call)
+    ordered = ordered_moves(board, None)
 
-        for move in ordered:
-            board.push(move)
-            score = -negamax(board, depth - 1, -math.inf, math.inf, model, device)
-            board.pop()
-
-            if depth == max_depth:
-                scores[move] = score
+    for move in ordered:
+        board.push(move)
+        score = -negamax(board, max_depth - 1, -math.inf, math.inf, model, device)
+        board.pop()
+        scores[move] = score
 
     return scores
 
-
-
-# # ---------------- Simple CLI Test ---------------- #
-
+# ---------------- Simple CLI Test (optional) ---------------- #
 # if __name__ == "__main__":
-#     # Example usage: search from the starting position
-#     model, device = load_model("value_net.pth", in_channels=18, channels=32, num_blocks=4)
-
-
+#     model, device = load_model("src/value_net.pth", in_channels=18, channels=32, num_blocks=4)
 #     fen = input("Enter FEN (or leave blank for starting position): ").strip()
 #     board = chess.Board(fen if fen else chess.STARTING_FEN)
-
 #     moves = evaluate_moves(board, max_depth=4, model=model, device=device, verbose=True)
-
 #     sorted_moves = sorted(moves.items(), key=lambda x: x[1])
-
-#     # Keep only the top 5 best moves
 #     top_5 = sorted_moves[-5:]
-
 #     print("\nTop 5 moves (best last):")
 #     for move, score in top_5:
 #         print(f"Move: {move}, Score: {score:.4f}")
